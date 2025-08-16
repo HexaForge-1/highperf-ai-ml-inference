@@ -1,0 +1,78 @@
+name: ci-cpu
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build & Test (CPU)
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CMAKE_BUILD_TYPE: Release
+    steps:
+      - uses: actions/checkout@v4
+
+      # Configure + build
+      - name: Configure
+        run: cmake -S . -B build -DBUILD_ONNXRUNTIME=ON -DBUILD_REST_API=ON -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }}
+      - name: Build
+        run: cmake --build build --config ${{ env.CMAKE_BUILD_TYPE }} -j
+
+      # Unit + ctest
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      # Basic static analysis (Linux only to keep it fast)
+      - name: clang-tidy (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          echo "Running clang-tidy on src/*"
+          clang-tidy --version || sudo apt-get update && sudo apt-get install -y clang-tidy
+          python3 - <<'PY'
+import os, subprocess, glob
+files = glob.glob('src/**/*.cpp', recursive=True) + glob.glob('src/*.cpp')
+if files:
+    subprocess.run(['clang-tidy', '-p', 'build', '-warnings-as-errors=*'] + files, check=False)
+PY
+
+      # Address/Undefined sanitizers (Linux only, quick smoke)
+      - name: ASAN/UBSAN smoke (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build_asan -DBUILD_ONNXRUNTIME=ON -DBUILD_REST_API=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_ASAN=ON
+          cmake --build build_asan -j
+          ctest --test-dir build_asan --output-on-failure
+
+      # Start server & e2e (Linux only)
+      - name: E2E smoke (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          ./scripts/e2e_smoke.sh
+
+      # Coverage (Linux only; Codecov optional)
+      - name: Coverage (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y lcov
+          lcov --capture --directory build --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' '**/tests/*' --output-file coverage.info
+          lcov --list coverage.info
+      # - name: Upload coverage to Codecov
+      #   if: runner.os == 'Linux'
+      #   uses: codecov/codecov-action@v4
+      #   with:
+      #     files: coverage.info
+      #     token: ${{ secrets.CODECOV_TOKEN }} # set in repo secrets
+
+      # Upload built binaries as artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: highperf-ai-ml-inference-${{ runner.os }}
+          path: |
+            build/bin/**
+            !**/*.pdb
